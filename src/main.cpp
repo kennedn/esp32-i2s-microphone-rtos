@@ -66,6 +66,7 @@ static void handleAudioStream() {
 
   // Immediately send audio/wav chunked header to client
   client->setTimeout(1);
+  client->setNoDelay(true);
   client->print(
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: audio/wav\r\n"
@@ -77,13 +78,11 @@ static void handleAudioStream() {
   client->printf("%X\r\n", (unsigned)sizeof(wav_header));
   client->write((const char*)&wav_header, sizeof(wav_header));
   client->print("\r\n");
-
+  client->flush(); 
+  
   // Push the client to the streaming queue
   xQueueSend(streamingClients, (void *) &client, 0);
 
-  if (eTaskGetState(tI2SAquire) == eSuspended) {
-    vTaskResume(tI2SAquire);
-  }
   if (eTaskGetState(tClientService) == eSuspended) {
     vTaskResume(tClientService);
   }
@@ -91,27 +90,24 @@ static void handleAudioStream() {
 }
 
 static void taskClientService(void *pv) {
-  TickType_t xLastWakeTime;
-  TickType_t xFrequency = pdMS_TO_TICKS(20);
   std::vector<uint8_t> chunk(2048);
   for (;;) {
     UBaseType_t activeClients = uxQueueMessagesWaiting(streamingClients);
     // No clients so we can pause this task.
     if ( !activeClients ) {
       vTaskSuspend(NULL);
-    }
-
-    size_t recievedBytes = xStreamBufferReceive(audio_sb, chunk.data(), chunk.size(), pdMS_TO_TICKS(10));
-    if (recievedBytes == 0) {
-      vTaskDelay(pdMS_TO_TICKS(2));
       continue;
     }
+
+    size_t recievedBytes = xStreamBufferReceive(audio_sb, chunk.data(), chunk.size(), portMAX_DELAY);
     
     WiFiClient *client;
     for (int i=0; i < activeClients; i++) {
       xQueueReceive(streamingClients, (void*)&client, 0);
+
       if (!client->connected()) {
         Serial.println("Client disconnected");
+        client->stop();
         delete client;
         continue;
       }
@@ -126,15 +122,16 @@ static void taskClientService(void *pv) {
 }
 
 void taskI2SAquire(void *pvParameters) {
- const size_t BYTES_PER_MS = (SAMPLE_RATE_HZ * (16 / 8)) / 1000; // 48k * 2 / 1000 = 96 B/ms
-  const size_t TARGET_BURST_BYTES = BYTES_PER_MS * 20;             // ~1920 bytes
+  // Chunk I2S data into ~20ms frames to send to stream buffer
+  const size_t BYTES_PER_MS = (SAMPLE_RATE_HZ * (16 / 8)) / 1000;  // 48k * 2 / 1000 = 96 B/ms
+  const size_t BYTES_BUFFER = BYTES_PER_MS * 20;                  // * 20ms = ~1920 bytes
 
-  std::vector<uint8_t> localBuf(4096);
+  i2s_event_t event;
+  std::vector<uint8_t> localBuf(BYTES_BUFFER);
   size_t burstBytes = 0;
 
 
   for (;;) {
-    i2s_event_t event;
     if (xQueueReceive(i2s_evtq, &event, portMAX_DELAY) != pdTRUE) {
       continue;
     }
@@ -143,39 +140,26 @@ void taskI2SAquire(void *pvParameters) {
     }
 
     size_t bytesRead = 0;
-    esp_err_t ok = i2s_read(I2S_PORT, localBuf.data(), localBuf.size(), &bytesRead, pdMS_TO_TICKS(1));
-    if (ok != ESP_OK || bytesRead == 0) {
+    esp_err_t ok = i2s_read(I2S_PORT, localBuf.data(), localBuf.size(), &bytesRead, portMAX_DELAY);
+    if (ok != ESP_OK) {
+      Serial.printf("i2s_read error: %d\n", ok);
       continue;
     }
-
-    // Push to lock-free stream buffer; block briefly if full to avoid spin.
-    size_t sent = 0;
-    while (sent < bytesRead) {
-      size_t n = xStreamBufferSend(audio_sb, localBuf.data() + sent, bytesRead - sent, pdMS_TO_TICKS(5));
-      if (n == 0) break;
-      sent += n;
-    }
-
-    burstBytes += bytesRead;
-
-    // After producing ~20 ms worth of data, pause ~20 ms.
-    if (burstBytes >= TARGET_BURST_BYTES) {
-      Serial.println("I2S burst target reached, pausing for 20ms");
-      vTaskDelay(pdMS_TO_TICKS(20));
-      burstBytes = 0;
-    }
-
-    // If no clients are being streamed to, we can stop this task.
-    if ( eTaskGetState( tClientService ) == eSuspended ) {
-      vTaskSuspend(NULL);  // passing NULL means "suspend yourself"
-    }
+    
+    xStreamBufferSend(audio_sb, localBuf.data(), bytesRead, portMAX_DELAY);
   }
 }
 
 void taskStreamSetup(void *pvParameters) {
   TickType_t xLastWakeTime;
   const TickType_t xFrequency = pdMS_TO_TICKS(WSINTERVAL);
-  audio_sb = xStreamBufferCreate(64 * 1024, 0);
+
+  // Reserve ~200ms of audio buffer and trigger in 20ms chunks, this sets the cadence of the xStreamBufferReceive in taskClientService
+  const size_t BYTES_PER_MS = (SAMPLE_RATE_HZ * (16 / 8)) / 1000;  // 48k * 2 / 1000 = 96 B/ms
+  const size_t AUDIO_FRAME = BYTES_PER_MS * 20;           // * 20ms = ~1920 bytes                    
+  const size_t BUFFER_SIZE = BYTES_PER_MS * 200;           // * 200ms = ~19.2k bytes
+  audio_sb = xStreamBufferCreate(BUFFER_SIZE, AUDIO_FRAME);
+
   streamingClients = xQueueCreate( 10, sizeof(WiFiClient*) );
   // ---- HTTP endpoints ----
   server.onNotFound(handleRoot);
@@ -207,7 +191,7 @@ static void I2SSetup() {
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = DMA_BUF_COUNT,
     .dma_buf_len = DMA_BUF_LEN,
-    .use_apll = false,
+    .use_apll = true,
     .tx_desc_auto_clear = false,
     .fixed_mclk = 0
   };
@@ -222,10 +206,7 @@ static void I2SSetup() {
   // Install driver with event queue so we can react to DMA completion
   ESP_ERROR_CHECK(i2s_driver_install(I2S_PORT, &cfg, /*queue size*/ 8, &i2s_evtq));
   ESP_ERROR_CHECK(i2s_set_pin(I2S_PORT, &pins));
-
-  // Some mics need this to ensure slot width is 32 bits even in mono
-  ESP_ERROR_CHECK(i2s_set_clk(I2S_PORT, SAMPLE_RATE_HZ, BPS, I2S_CHANNEL_MONO));
-  // Note: If your mic is RIGHT-only, keep I2S_CHANNEL_MONO but set CH_FMT to ONLY_RIGHT above.
+  ESP_ERROR_CHECK(i2s_start(I2S_PORT));
 }
 
 
