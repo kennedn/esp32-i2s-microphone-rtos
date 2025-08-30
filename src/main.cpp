@@ -12,28 +12,23 @@
 #define PIN_I2S_SD       12   // SD  (mic data out)
 
 #define I2S_PORT I2S_NUM_0
-#define SAMPLE_RATE_HZ 48000
-#define BPS I2S_BITS_PER_SAMPLE_16BIT
+#define SAMPLE_RATE_HZ 44100
+#define BPS I2S_BITS_PER_SAMPLE_32BIT
 #define CH_FMT I2S_CHANNEL_FMT_ONLY_LEFT
 
 #define DMA_BUF_COUNT 8
 #define DMA_BUF_LEN 256 // frames per DMA buffer (tune for latency/CPU)
 
-/* Stream buffer (lock-free ring). Size in bytes; must hold a few DMA buffers. */
-static const size_t STREAM_CAP_BYTES = 64 * 1024;
-
 /* ======== WAV header (for 16-bit mono PCM) ======== */
 const uint16_t num_channels = 1; // mono
 const uint32_t sample_size = 0xFFFFFFFF; // live stream, so set max size since unknown
-const pcm_wav_header_t wav_header = PCM_WAV_HEADER_DEFAULT(sample_size, BPS, SAMPLE_RATE_HZ, num_channels); 
+const pcm_wav_header_t wav_header = PCM_WAV_HEADER_DEFAULT(sample_size, I2S_BITS_PER_SAMPLE_24BIT, SAMPLE_RATE_HZ, num_channels); 
 
 /* ======== Globals ======== */
 TaskHandle_t tStreamSetup;
 TaskHandle_t tI2SAquire;
 TaskHandle_t tClientService;
-static QueueHandle_t i2s_evtq = nullptr;
 static QueueHandle_t streamingClients = nullptr;
-static StreamBufferHandle_t audio_sb = nullptr;
 // ---- HTTP server ----
 WebServer server(80);
 
@@ -90,7 +85,11 @@ static void handleAudioStream() {
 }
 
 static void taskClientService(void *pv) {
-  std::vector<uint8_t> chunk(2048);
+  const size_t BYTES_PER_MS = (SAMPLE_RATE_HZ * (BPS / 8)) / 1000;  // 48k * 2 / 1000 = 96 B/ms
+  const size_t BYTES_BUFFER = BYTES_PER_MS * 20;                  // * 20ms = ~1920 bytes
+  std::vector<uint8_t> localBuf(BYTES_BUFFER);
+  std::vector<uint8_t> transBuf(localBuf.size() / 4 * 3);
+
   for (;;) {
     UBaseType_t activeClients = uxQueueMessagesWaiting(streamingClients);
     // No clients so we can pause this task.
@@ -99,7 +98,21 @@ static void taskClientService(void *pv) {
       continue;
     }
 
-    size_t recievedBytes = xStreamBufferReceive(audio_sb, chunk.data(), chunk.size(), portMAX_DELAY);
+    size_t recievedBytes = 0;
+    esp_err_t ok = i2s_read(I2S_PORT, localBuf.data(), localBuf.size(), &recievedBytes, portMAX_DELAY);
+    if (ok != ESP_OK) {
+      Serial.printf("i2s_read error: %d\n", ok);
+      continue;
+    }
+
+    int32_t *w = (int32_t*)localBuf.data();
+    Serial.printf("I2S first words: %08X %08X %08X %08X\n", w[0], w[1], w[2], w[3]);
+
+    for (size_t i = 0, j = 0; i + 3 < recievedBytes; i += 4, j += 3) {
+      transBuf[j]   = localBuf[i+1];
+      transBuf[j+1] = localBuf[i+2];
+      transBuf[j+2] = localBuf[i+3];
+    }
     
     WiFiClient *client;
     for (int i=0; i < activeClients; i++) {
@@ -112,8 +125,8 @@ static void taskClientService(void *pv) {
         continue;
       }
    
-      client->printf("%X\r\n", recievedBytes);
-      client->write(chunk.data(), recievedBytes);
+      client->printf("%X\r\n", transBuf.size());
+      client->write(transBuf.data(), transBuf.size());
       client->print("\r\n");
 
       xQueueSend(streamingClients, (void *) &client, 0);
@@ -121,44 +134,38 @@ static void taskClientService(void *pv) {
   }
 }
 
-void taskI2SAquire(void *pvParameters) {
-  // Chunk I2S data into ~20ms frames to send to stream buffer
-  const size_t BYTES_PER_MS = (SAMPLE_RATE_HZ * (16 / 8)) / 1000;  // 48k * 2 / 1000 = 96 B/ms
-  const size_t BYTES_BUFFER = BYTES_PER_MS * 20;                  // * 20ms = ~1920 bytes
+// void taskI2SAquire(void *pvParameters) {
+//   // Chunk I2S data into ~20ms frames to send to stream buffer
+//   const size_t BYTES_PER_MS = (SAMPLE_RATE_HZ * (BPS / 8)) / 1000;  // 48k * 2 / 1000 = 96 B/ms
+//   const size_t BYTES_BUFFER = BYTES_PER_MS * 20;                  // * 20ms = ~1920 bytes
 
-  i2s_event_t event;
-  std::vector<uint8_t> localBuf(BYTES_BUFFER);
-  size_t burstBytes = 0;
+//   i2s_event_t event;
+//   std::vector<uint8_t> localBuf(BYTES_BUFFER);
+//   size_t burstBytes = 0;
 
 
-  for (;;) {
-    if (xQueueReceive(i2s_evtq, &event, portMAX_DELAY) != pdTRUE) {
-      continue;
-    }
-    if (event.type != I2S_EVENT_RX_DONE) {
-      continue;
-    }
+//   for (;;) {
+//     if (xQueueReceive(i2s_evtq, &event, portMAX_DELAY) != pdTRUE) {
+//       continue;
+//     }
+//     if (event.type != I2S_EVENT_RX_DONE) {
+//       continue;
+//     }
 
-    size_t bytesRead = 0;
-    esp_err_t ok = i2s_read(I2S_PORT, localBuf.data(), localBuf.size(), &bytesRead, portMAX_DELAY);
-    if (ok != ESP_OK) {
-      Serial.printf("i2s_read error: %d\n", ok);
-      continue;
-    }
+//     size_t bytesRead = 0;
+//     esp_err_t ok = i2s_read(I2S_PORT, localBuf.data(), localBuf.size(), &bytesRead, portMAX_DELAY);
+//     if (ok != ESP_OK) {
+//       Serial.printf("i2s_read error: %d\n", ok);
+//       continue;
+//     }
     
-    xStreamBufferSend(audio_sb, localBuf.data(), bytesRead, portMAX_DELAY);
-  }
-}
+//     xStreamBufferSend(audio_sb, localBuf.data(), bytesRead, portMAX_DELAY);
+//   }
+// }
 
 void taskStreamSetup(void *pvParameters) {
   TickType_t xLastWakeTime;
   const TickType_t xFrequency = pdMS_TO_TICKS(WSINTERVAL);
-
-  // Reserve ~200ms of audio buffer and trigger in 20ms chunks, this sets the cadence of the xStreamBufferReceive in taskClientService
-  const size_t BYTES_PER_MS = (SAMPLE_RATE_HZ * (16 / 8)) / 1000;  // 48k * 2 / 1000 = 96 B/ms
-  const size_t AUDIO_FRAME = BYTES_PER_MS * 20;           // * 20ms = ~1920 bytes                    
-  const size_t BUFFER_SIZE = BYTES_PER_MS * 200;           // * 200ms = ~19.2k bytes
-  audio_sb = xStreamBufferCreate(BUFFER_SIZE, AUDIO_FRAME);
 
   streamingClients = xQueueCreate( 10, sizeof(WiFiClient*) );
   // ---- HTTP endpoints ----
@@ -168,7 +175,7 @@ void taskStreamSetup(void *pvParameters) {
 
   Serial.println("[HTTP] Server started");
 
-  xTaskCreatePinnedToCore(taskI2SAquire, "taskI2SAquire", 4 * 1024, NULL, tskIDLE_PRIORITY + 2, &tI2SAquire, 1);
+  // xTaskCreatePinnedToCore(taskI2SAquire, "taskI2SAquire", 4 * 1024, NULL, tskIDLE_PRIORITY + 2, &tI2SAquire, 1);
   xTaskCreatePinnedToCore(taskClientService, "taskClientService", 4 * 1024, NULL, tskIDLE_PRIORITY + 2, &tClientService, 1);
 
   xLastWakeTime = xTaskGetTickCount();
@@ -191,9 +198,6 @@ static void I2SSetup() {
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = DMA_BUF_COUNT,
     .dma_buf_len = DMA_BUF_LEN,
-    .use_apll = true,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk = 0
   };
 
   i2s_pin_config_t pins = {
@@ -204,7 +208,7 @@ static void I2SSetup() {
   };
 
   // Install driver with event queue so we can react to DMA completion
-  ESP_ERROR_CHECK(i2s_driver_install(I2S_PORT, &cfg, /*queue size*/ 8, &i2s_evtq));
+  ESP_ERROR_CHECK(i2s_driver_install(I2S_PORT, &cfg, 0, nullptr));
   ESP_ERROR_CHECK(i2s_set_pin(I2S_PORT, &pins));
   ESP_ERROR_CHECK(i2s_start(I2S_PORT));
 }
