@@ -6,6 +6,16 @@
 #include <wav_header.h>
 #include "freertos/stream_buffer.h"
 
+#if defined(BENCHMARK)
+#include <AverageFilter.h>
+#define BENCHMARK_PRINT_INT 1000
+averageFilter<int32_t> streamAvg(10);
+uint32_t lastPrint = millis();
+#endif
+
+void benchmarkStreamAvgPrint() {
+}
+
 #define WSINTERVAL 100
 
 #define PIN_I2S_BCLK     13   // I2S Bit Clock
@@ -92,15 +102,17 @@ static void taskClientService(void *pv) {
   const size_t BYTES_BUFFER = BYTES_PER_MS * 20; // ~20ms of audio
   std::vector<uint8_t> localBuf(BYTES_BUFFER);
   // std::vector<uint8_t> transBuf(localBuf.size() / 4 * 3);
-
+  uint32_t streamStart = 0;
   for (;;) {
+#if defined(BENCHMARK)
+    streamStart = micros();
+#endif
     UBaseType_t activeClients = uxQueueMessagesWaiting(streamingClients);
     // No clients, suspend this task
     if ( !activeClients ) {
       vTaskSuspend(NULL);
       continue;
     }
-
     size_t recievedBytes = i2s.readBytes((char*)localBuf.data(), localBuf.size());
 
     // int32_t *w = (int32_t*)localBuf.data();
@@ -130,6 +142,9 @@ static void taskClientService(void *pv) {
 
       xQueueSend(streamingClients, (void *) &client, 0);
     }
+#if defined(BENCHMARK)
+    streamAvg.value(micros() - streamStart);
+#endif
   }
 }
 
@@ -182,6 +197,13 @@ void taskStreamSetup(void *pvParameters) {
   xLastWakeTime = xTaskGetTickCount();
   for (;;) {
     server.handleClient();
+    
+#if defined(BENCHMARK)
+    if (millis() - lastPrint > BENCHMARK_PRINT_INT) {
+        lastPrint = millis();
+        Serial.printf("streamCB: stream avg=%d us\n", streamAvg.currentValue());
+    }
+#endif
 
     // Let other tasks run and then pause
     if ( xTaskDelayUntil(&xLastWakeTime, xFrequency) != pdTRUE ) taskYIELD();
